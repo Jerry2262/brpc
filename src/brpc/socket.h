@@ -938,8 +938,12 @@ private:
 
     butil::atomic<SocketId> _agent_socket_id;
 
-    butil::Mutex _pipeline_mutex;
-    std::deque<PipelinedInfo>* _pipeline_q;
+    // Lock-free SPSC ring buffer for pipelined request tracking.
+    // Capacity is chosen to be well above any realistic pipeline depth.
+    static constexpr size_t kPipelineBufferSize = 64;
+    butil::atomic<size_t> _pipeline_head{0};
+    butil::atomic<size_t> _pipeline_tail{0};
+    PipelinedInfo _pipeline_buf[kPipelineBufferSize];
 
     // For storing call-id of in-progress RPC.
     pthread_mutex_t _id_wait_list_mutex;

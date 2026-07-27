@@ -481,7 +481,6 @@ Socket::Socket(Forbidden f)
     , _fail_me_at_server_stop(false)
     , _logoff_flag(false)
     , _error_code(0)
-    , _pipeline_q(NULL)
     , _last_writetime_us(0)
     , _unwritten_bytes(0)
     , _epollout_butex(NULL)
@@ -883,9 +882,6 @@ void Socket::BeforeRecycled() {
 
     _ssl_ctx = NULL;
 
-    delete _pipeline_q;
-    _pipeline_q = NULL;
-
     delete _auth_context;
     _auth_context = NULL;
 
@@ -1055,10 +1051,8 @@ int Socket::WaitAndReset(int32_t expected_nref) {
     _last_writetime_us.store(cpuwide_now, butil::memory_order_relaxed);
     _logoff_flag.store(false, butil::memory_order_relaxed);
     {
-        BAIDU_SCOPED_LOCK(_pipeline_mutex);
-        if (_pipeline_q) {
-            _pipeline_q->clear();
-        }
+        _pipeline_head.store(0, butil::memory_order_relaxed);
+        _pipeline_tail.store(0, butil::memory_order_relaxed);
     }
 
     SharedPart* sp = GetSharedPart();
@@ -2341,10 +2335,10 @@ void Socket::DebugSocket(std::ostream& os, SocketId id) {
     size_t idsizes[4];
     size_t nidsize = 0;
     {
-        BAIDU_SCOPED_LOCK(ptr->_pipeline_mutex);
-        if (ptr->_pipeline_q) {
-            npipelined = ptr->_pipeline_q->size();
-        }
+        const size_t head = ptr->_pipeline_head.load(butil::memory_order_acquire);
+        const size_t tail = ptr->_pipeline_tail.load(butil::memory_order_relaxed);
+        npipelined = (tail >= head) ? (tail - head)
+                                    : (kPipelineBufferSize + tail - head);
     }
     {
         BAIDU_SCOPED_LOCK(ptr->_id_wait_list_mutex);
