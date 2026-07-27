@@ -153,12 +153,12 @@ bool RedisRequest::AddCommandV(const char* fmt, va_list ap) {
     }
 }
 
-bool RedisRequest::SerializeTo(butil::IOBuf* buf) const {
+bool RedisRequest::SerializeTo(butil::IOBuf* buf) {
     if (_has_error) {
         LOG(ERROR) << "Reject serialization due to error in AddCommand[V]";
         return false;
     }
-    *buf = _buf;
+    *buf = _buf.movable();
     return true;
 }
 

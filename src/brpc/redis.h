@@ -103,7 +103,7 @@ public:
     bool has_error() const { return _has_error; }
 
     // Serialize the request into `buf'. Return true on success.
-    bool SerializeTo(butil::IOBuf* buf) const;
+    bool SerializeTo(butil::IOBuf* buf);
 
     // Protobuf methods.
     void MergeFrom(const RedisRequest& from) override;

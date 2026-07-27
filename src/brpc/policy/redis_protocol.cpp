@@ -280,7 +280,7 @@ void SerializeRedisRequest(butil::IOBuf* buf,
     if (request->GetDescriptor() != RedisRequest::descriptor()) {
         return cntl->SetFailed(EREQUEST, "The request is not a RedisRequest");
     }
-    const RedisRequest* rr = (const RedisRequest*)request;
+    RedisRequest* rr = (RedisRequest*)request;
     // If redis byte size is zero, brpc call will fail with E22. Continuous E22 may cause E112 in the end.
     // So set failed and return useful error message
     if (rr->ByteSize() == 0) {
