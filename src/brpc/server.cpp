@@ -20,6 +20,7 @@
 #include <arpa/inet.h>                              // inet_aton
 #include <fcntl.h>                                  // O_CREAT
 #include <sys/stat.h>                               // mkdir
+#include <sys/un.h>                                 // sockaddr_un
 #include <gflags/gflags.h>
 #include <google/protobuf/descriptor.h>             // ServiceDescriptor
 #include "idl_options.pb.h"                         // option(idl_support)
@@ -110,6 +111,23 @@ const char* status_str(Server::Status s) {
     case Server::STOPPING: return "STOPPING";
     }
     return "UNKNOWN_STATUS";
+}
+
+void RemoveUnixSocketPath(const butil::EndPoint& endpoint) {
+    sockaddr_storage storage;
+    socklen_t size = 0;
+    if (butil::endpoint2sockaddr(endpoint, &storage, &size) != 0 ||
+        storage.ss_family != AF_UNIX) {
+        return;
+    }
+
+    const sockaddr_un* address =
+        reinterpret_cast<const sockaddr_un*>(&storage);
+    if (address->sun_path[0] != '\0' &&
+        unlink(address->sun_path) != 0 && errno != ENOENT) {
+        PLOG(WARNING) << "Fail to remove unix socket path="
+                      << address->sun_path;
+    }
 }
 
 butil::static_atomic<int> g_running_server_count = BUTIL_STATIC_ATOMIC_INIT(0);
@@ -1324,6 +1342,7 @@ int Server::Stop(int timeout_ms) {
     if (_am) {
         _am->StopAccept(timeout_ms);
     }
+    RemoveUnixSocketPath(_listen_addr);
     if (_internal_am) {
         // TODO: calculate timeout?
         _internal_am->StopAccept(timeout_ms);
