@@ -286,6 +286,9 @@ struct SocketOptions {
     int tcp_user_timeout_ms{ -1};
     // Tag of this socket
     bthread_tag_t bthread_tag{bthread_self_tag()};
+    // When true, the Socket has a single writer and StartWrite can use
+    // a fast path skipping the atomic CAS on _write_head.
+    bool single_writer{false};
     HealthCheckOption hc_option;
 };
 
@@ -906,6 +909,8 @@ private:
 
     // Only accept ssl connection.
     bool _force_ssl;
+    // Set by SocketOptions::single_writer to skip atomic CAS in StartWrite.
+    bool _single_writer{false};
     SSLState _ssl_state;
     // SSL objects cannot be read and written at the same time.
     // Use mutex to protect SSL objects when ssl_state is SSL_CONNECTED.

@@ -368,8 +368,11 @@ int Channel::InitSingle(const butil::EndPoint& server_addr_and_port,
     if (CreateSocketSSLContext(_options, &ssl_ctx) != 0) {
         return -1;
     }
+    const bool single_writer =
+        (_options.connection_type == CONNECTION_TYPE_SINGLE);
     if (SocketMapInsert(SocketMapKey(server_addr_and_port, sig),
-                        &_server_id, ssl_ctx, _options.use_rdma, _options.hc_option) != 0) {
+                        &_server_id, ssl_ctx, _options.use_rdma,
+                        _options.hc_option, single_writer) != 0) {
         LOG(ERROR) << "Fail to insert into SocketMap";
         return -1;
     }

@@ -741,6 +741,7 @@ int Socket::OnCreated(const SocketOptions& options) {
     _correlation_id = 0;
     _health_check_interval_s = options.health_check_interval_s;
     _hc_option = options.hc_option;
+    _single_writer = options.single_writer;
     _is_hc_related_ref_held = false;
     _ninprocess.store(1, butil::memory_order_relaxed);
     _auth_flag_error.store(0, butil::memory_order_relaxed);
@@ -1687,17 +1688,20 @@ int Socket::Write(SocketMessagePtr<>& msg, const WriteOptions* options_in) {
 }
 
 int Socket::StartWrite(WriteRequest* req, const WriteOptions& opt) {
-    // Release fence makes sure the thread getting request sees *req
-    WriteRequest* const prev_head =
-        _write_head.exchange(req, butil::memory_order_release);
-    if (prev_head != NULL) {
-        // Someone is writing to the fd. The KeepWrite thread may spin
-        // until req->next to be non-UNCONNECTED. This process is not
-        // lock-free, but the duration is so short(1~2 instructions,
-        // depending on compiler) that the spin rarely occurs in practice
-        // (I've not seen any spin in highly contended tests).
-        req->next = prev_head;
-        return 0;
+    if (!_single_writer) {
+        // Multi-writer path: use atomic CAS to serialize writers.
+        // Release fence makes sure the thread getting request sees *req
+        WriteRequest* const prev_head =
+            _write_head.exchange(req, butil::memory_order_release);
+        if (prev_head != NULL) {
+            // Someone is writing to the fd. The KeepWrite thread may spin
+            // until req->next to be non-UNCONNECTED. This process is not
+            // lock-free, but the duration is so short(1~2 instructions,
+            // depending on compiler) that the spin rarely occurs in practice
+            // (I've not seen any spin in highly contended tests).
+            req->next = prev_head;
+            return 0;
+        }
     }
 
     int saved_errno = 0;
