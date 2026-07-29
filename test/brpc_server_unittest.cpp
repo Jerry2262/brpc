@@ -281,6 +281,22 @@ TEST_F(ServerTest, sanity) {
     ASSERT_EQ(0, server.Join());
 }
 
+TEST_F(ServerTest, removes_unix_socket_path_on_stop) {
+    const std::string socket_path =
+        butil::string_printf("/tmp/brpc_server_unittest_%d.sock", getpid());
+    const std::string endpoint = "unix:" + socket_path;
+    unlink(socket_path.c_str());
+
+    brpc::Server server;
+    ASSERT_EQ(0, server.Start(endpoint.c_str(), NULL));
+    ASSERT_EQ(0, access(socket_path.c_str(), F_OK));
+    ASSERT_EQ(0, server.Stop(0));
+    ASSERT_EQ(0, server.Join());
+    EXPECT_NE(0, access(socket_path.c_str(), F_OK));
+
+    unlink(socket_path.c_str());
+}
+
 TEST_F(ServerTest, invalid_protocol_in_enabled_protocols) {
     butil::EndPoint ep;
     ASSERT_EQ(0, str2endpoint("127.0.0.1:8613", &ep));
