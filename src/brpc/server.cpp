@@ -113,7 +113,7 @@ const char* status_str(Server::Status s) {
     return "UNKNOWN_STATUS";
 }
 
-void RemoveUnixSocketPath(const butil::EndPoint& endpoint) {
+static void RemoveUnixSocketPath(const butil::EndPoint& endpoint) {
     sockaddr_storage storage;
     socklen_t size = 0;
     if (butil::endpoint2sockaddr(endpoint, &storage, &size) != 0 ||
