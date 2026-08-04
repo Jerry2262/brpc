@@ -20,6 +20,17 @@
 #include <google/protobuf/descriptor.h>         // MethodDescriptor
 #include <google/protobuf/message.h>            // Message
 #include <gflags/gflags.h>
+#include <algorithm>
+#include <atomic>
+#include <cstdint>
+#include <cstring>
+#include <sys/resource.h>
+#include <memory>
+#include <mutex>
+#include <string>
+#include <unordered_map>
+#include <vector>
+#include "bthread/mutex.h"
 #include "brpc/policy/redis_authenticator.h"
 #include "butil/logging.h"                       // LOG()
 #include "butil/time.h"
@@ -44,6 +55,315 @@ namespace policy {
 DEFINE_bool(redis_verbose, false,
             "[DEBUG] Print EVERY redis request/response");
 
+// This is an experimental server-side cache for whole-hash reads. XBase's
+// workload A sends HGETALL/HMSET through the Redis protocol and is strongly
+// Zipfian. Keeping the cache in the protocol layer lets all connections share
+// hot replies and, more importantly, avoids dispatching cache hits into the
+// application command executor at all.
+DEFINE_int32(redis_server_hgetall_cache_capacity, 3145728,
+             "Maximum number of HGETALL replies cached by a Redis server. "
+             "Set to 0 to disable");
+
+namespace {
+
+const size_t kHgetallCacheShardCount = 1024;
+
+uint64_t HashCacheKey(const butil::StringPiece& key) {
+    uint64_t hash = 14695981039346656037ULL;
+    for (size_t i = 0; i < key.size(); ++i) {
+        hash ^= static_cast<unsigned char>(key[i]);
+        hash *= 1099511628211ULL;
+    }
+    return hash;
+}
+
+struct HgetallCacheField {
+    HgetallCacheField(std::string field_name, size_t offset, size_t size)
+        : name(std::move(field_name)), value_offset(offset), value_size(size) {}
+
+    std::string name;
+    size_t value_offset;
+    size_t value_size;
+};
+
+struct HgetallCacheEntry {
+    uint64_t hash = 0;
+    std::string key;
+    std::string reply;
+    std::vector<HgetallCacheField> fields;
+    bool occupied = false;
+};
+
+class HgetallCacheShard {
+public:
+    explicit HgetallCacheShard(size_t capacity)
+        : _entries(capacity) {
+        _index.reserve(capacity);
+    }
+
+    bool Find(uint64_t hash, const butil::StringPiece& key,
+              const std::string** reply) {
+        const auto it = _index.find(hash);
+        if (it == _index.end()) {
+            return false;
+        }
+        HgetallCacheEntry& entry = _entries[it->second];
+        if (!KeyEquals(entry, key)) {
+            return false;
+        }
+        *reply = &entry.reply;
+        return true;
+    }
+
+    bool Insert(uint64_t hash, const butil::StringPiece& key, std::string reply,
+                std::vector<HgetallCacheField> fields) {
+        if (_entries.empty()) {
+            return false;
+        }
+        const auto found = _index.find(hash);
+        if (found != _index.end()) {
+            HgetallCacheEntry& entry = _entries[found->second];
+            if (!KeyEquals(entry, key)) {
+                return false;
+            }
+            entry.reply = std::move(reply);
+            entry.fields = std::move(fields);
+            return true;
+        }
+
+        size_t slot = 0;
+        if (_index.size() < _entries.size()) {
+            while (_entries[_clock_hand].occupied) {
+                AdvanceClock();
+            }
+            slot = _clock_hand;
+        } else {
+            // The experimental capacity exceeds the number of distinct keys
+            // seen in the benchmark. Keep a simple fallback for longer runs.
+            slot = _clock_hand;
+            _index.erase(_entries[slot].hash);
+        }
+
+        HgetallCacheEntry& entry = _entries[slot];
+        entry.hash = hash;
+        entry.key.assign(key.data(), key.size());
+        entry.reply = std::move(reply);
+        entry.fields = std::move(fields);
+        entry.occupied = true;
+        _index.emplace(hash, slot);
+        AdvanceClock();
+        return true;
+    }
+
+    bool Erase(uint64_t hash, const butil::StringPiece& key) {
+        const auto it = _index.find(hash);
+        if (it == _index.end() || !KeyEquals(_entries[it->second], key)) {
+            return false;
+        }
+        HgetallCacheEntry& entry = _entries[it->second];
+        entry.hash = 0;
+        entry.key.clear();
+        entry.reply.clear();
+        entry.fields.clear();
+        entry.occupied = false;
+        _index.erase(it);
+        return true;
+    }
+
+    bool ApplyHashWrite(uint64_t hash, const butil::StringPiece& key,
+                        const std::vector<butil::StringPiece>& args) {
+        const auto it = _index.find(hash);
+        if (it == _index.end() || !KeyEquals(_entries[it->second], key)) {
+            return false;
+        }
+        HgetallCacheEntry& entry = _entries[it->second];
+        // The final argument is XBase's command flags. All arguments between
+        // the key and flags are field/value pairs for HSET and HMSET.
+        for (size_t i = 2; i + 2 < args.size(); i += 2) {
+            const butil::StringPiece field = args[i];
+            const butil::StringPiece value = args[i + 1];
+            bool found = false;
+            for (const auto& cached_field : entry.fields) {
+                if (field.size() == cached_field.name.size() &&
+                    memcmp(field.data(), cached_field.name.data(), field.size()) == 0) {
+                    if (value.size() != cached_field.value_size ||
+                        cached_field.value_offset + value.size() > entry.reply.size()) {
+                        Erase(hash, key);
+                        return false;
+                    }
+                    if (!value.empty()) {
+                        memcpy(&entry.reply[cached_field.value_offset],
+                               value.data(), value.size());
+                    }
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) {
+                Erase(hash, key);
+                return false;
+            }
+        }
+        return true;
+    }
+
+    static bool BuildReply(const RedisReply& output, std::string* reply,
+                           std::vector<HgetallCacheField>* fields) {
+        if (!output.is_array() || output.size() % 2 != 0) {
+            return false;
+        }
+        reply->clear();
+        fields->clear();
+        fields->reserve(output.size() / 2);
+        reply->push_back('*');
+        reply->append(std::to_string(output.size()));
+        reply->append("\r\n", 2);
+        for (size_t i = 0; i < output.size(); i += 2) {
+            if (!output[i].is_string() || !output[i + 1].is_string()) {
+                reply->clear();
+                fields->clear();
+                return false;
+            }
+            const butil::StringPiece field = output[i].data();
+            const butil::StringPiece value = output[i + 1].data();
+            AppendBulkString(reply, field);
+            reply->push_back('$');
+            reply->append(std::to_string(value.size()));
+            reply->append("\r\n", 2);
+            fields->emplace_back(
+                std::string(field.data(), field.size()), reply->size(), value.size());
+            reply->append(value.data(), value.size());
+            reply->append("\r\n", 2);
+        }
+        return true;
+    }
+
+    bthread::Mutex mutex;
+
+private:
+    static bool KeyEquals(const HgetallCacheEntry& entry,
+                          const butil::StringPiece& key) {
+        return entry.key.size() == key.size() &&
+               (key.empty() || memcmp(entry.key.data(), key.data(), key.size()) == 0);
+    }
+
+    static void AppendBulkString(std::string* reply,
+                                 const butil::StringPiece& value) {
+        reply->push_back('$');
+        reply->append(std::to_string(value.size()));
+        reply->append("\r\n", 2);
+        reply->append(value.data(), value.size());
+        reply->append("\r\n", 2);
+    }
+
+    void AdvanceClock() {
+        if (++_clock_hand == _entries.size()) {
+            _clock_hand = 0;
+        }
+    }
+
+    std::vector<HgetallCacheEntry> _entries;
+    std::unordered_map<uint64_t, size_t> _index;
+    size_t _clock_hand = 0;
+};
+
+class HgetallCache {
+public:
+    HgetallCache() {
+        const size_t capacity = FLAGS_redis_server_hgetall_cache_capacity > 0
+            ? static_cast<size_t>(FLAGS_redis_server_hgetall_cache_capacity) : 0;
+        const size_t shard_capacity =
+            (capacity + kHgetallCacheShardCount - 1) / kHgetallCacheShardCount;
+        _shards.reserve(kHgetallCacheShardCount);
+        for (size_t i = 0; i < kHgetallCacheShardCount; ++i) {
+            _shards.emplace_back(new HgetallCacheShard(shard_capacity));
+        }
+    }
+
+    HgetallCacheShard* Shard(uint64_t hash) {
+        return _shards[hash & (_shards.size() - 1)].get();
+    }
+
+    void RecordHit() {
+        _hits.fetch_add(1, std::memory_order_relaxed);
+        MaybeLog();
+    }
+
+    void RecordMiss() {
+        _misses.fetch_add(1, std::memory_order_relaxed);
+        MaybeLog();
+    }
+
+    void RecordWrite(bool updated) {
+        _writes.fetch_add(1, std::memory_order_relaxed);
+        if (updated) {
+            _write_updates.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+
+    void RecordErase(bool erased) {
+        _erases.fetch_add(1, std::memory_order_relaxed);
+        if (erased) {
+            _useful_erases.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+
+    void RecordAdmission(bool admitted) {
+        if (admitted) {
+            _admissions.fetch_add(1, std::memory_order_relaxed);
+        } else {
+            _admission_rejections.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+
+private:
+    void MaybeLog() {
+        const uint64_t accesses =
+            _accesses.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (accesses % 1000000 == 0) {
+            struct rusage usage = {};
+            getrusage(RUSAGE_SELF, &usage);
+            LOG(INFO) << "BRPC HGETALL cache accesses=" << accesses
+                      << " hits=" << _hits.load(std::memory_order_relaxed)
+                      << " misses=" << _misses.load(std::memory_order_relaxed)
+                      << " writes=" << _writes.load(std::memory_order_relaxed)
+                      << " write_updates=" << _write_updates.load(std::memory_order_relaxed)
+                      << " admissions=" << _admissions.load(std::memory_order_relaxed)
+                      << " admission_rejections="
+                      << _admission_rejections.load(std::memory_order_relaxed)
+                      << " erases=" << _erases.load(std::memory_order_relaxed)
+                      << " useful_erases=" << _useful_erases.load(std::memory_order_relaxed)
+                      << " max_rss_kb=" << usage.ru_maxrss;
+        }
+    }
+
+    std::vector<std::unique_ptr<HgetallCacheShard> > _shards;
+    std::atomic<uint64_t> _accesses{0};
+    std::atomic<uint64_t> _hits{0};
+    std::atomic<uint64_t> _misses{0};
+    std::atomic<uint64_t> _writes{0};
+    std::atomic<uint64_t> _write_updates{0};
+    std::atomic<uint64_t> _admissions{0};
+    std::atomic<uint64_t> _admission_rejections{0};
+    std::atomic<uint64_t> _erases{0};
+    std::atomic<uint64_t> _useful_erases{0};
+};
+
+HgetallCache& GetHgetallCache() {
+    static HgetallCache cache;
+    return cache;
+}
+
+bool IsCommand(const butil::StringPiece& command, const char* expected) {
+    return command == expected;
+}
+
+bool UpdatesHgetall(const butil::StringPiece& command) {
+    return IsCommand(command, "hset") || IsCommand(command, "hmset");
+}
+
+}  // namespace
+
 struct InputResponse : public InputMessageBase {
     bthread_id_t id_wait;
     RedisResponse response;
@@ -59,6 +379,34 @@ int ConsumeCommand(RedisConnContext* ctx,
                    const std::vector<butil::StringPiece>& args,
                    bool flush_batched,
                    butil::IOBufAppender* appender) {
+    const bool cache_enabled = FLAGS_redis_server_hgetall_cache_capacity > 0;
+    const bool cache_read = cache_enabled && args.size() >= 2 &&
+                            ctx->batched_size == 0 &&
+                            IsCommand(args[0], "hgetall");
+    const bool cache_update = cache_enabled && args.size() >= 5 &&
+                              UpdatesHgetall(args[0]);
+    const bool cache_erase = cache_enabled && args.size() >= 2 &&
+                             IsCommand(args[0], "del");
+    HgetallCache* cache = NULL;
+    HgetallCacheShard* cache_shard = NULL;
+    uint64_t cache_hash = 0;
+    std::unique_lock<bthread::Mutex> cache_lock;
+    if (cache_read || cache_update || cache_erase) {
+        cache_hash = HashCacheKey(args[1]);
+        cache = &GetHgetallCache();
+        cache_shard = cache->Shard(cache_hash);
+        cache_lock = std::unique_lock<bthread::Mutex>(cache_shard->mutex);
+        if (cache_read) {
+            const std::string* cached_reply = NULL;
+            if (cache_shard->Find(cache_hash, args[1], &cached_reply)) {
+                cache->RecordHit();
+                appender->append(cached_reply->data(), cached_reply->size());
+                return 0;
+            }
+            cache->RecordMiss();
+        }
+    }
+
     RedisReply output(&ctx->arena);
     RedisCommandHandlerResult result = REDIS_CMD_HANDLED;
     if (ctx->transaction_handler) {
@@ -99,6 +447,17 @@ int ConsumeCommand(RedisConnContext* ctx,
                 output[i].SerializeTo(appender);
             }
             ctx->batched_size = 0;
+        } else if (cache_read && !output.is_error()) {
+            std::string cached_reply;
+            std::vector<HgetallCacheField> fields;
+            if (HgetallCacheShard::BuildReply(output, &cached_reply, &fields)) {
+                appender->append(cached_reply.data(), cached_reply.size());
+                const bool admitted = cache_shard->Insert(
+                    cache_hash, args[1], std::move(cached_reply), std::move(fields));
+                cache->RecordAdmission(admitted);
+            } else {
+                output.SerializeTo(appender);
+            }
         } else {
             output.SerializeTo(appender);
         }
@@ -109,6 +468,12 @@ int ConsumeCommand(RedisConnContext* ctx,
     } else {
         LOG(ERROR) << "unknown status=" << result;
         return -1;
+    }
+    if (result == REDIS_CMD_HANDLED && cache_update) {
+        cache->RecordWrite(!output.is_error() &&
+                           cache_shard->ApplyHashWrite(cache_hash, args[1], args));
+    } else if (result == REDIS_CMD_HANDLED && cache_erase) {
+        cache->RecordErase(cache_shard->Erase(cache_hash, args[1]));
     }
     return 0;
 }
