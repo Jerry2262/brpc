@@ -19,6 +19,8 @@
 #ifndef BRPC_REDIS_REPLY_H
 #define BRPC_REDIS_REPLY_H
 
+#include <stdint.h>
+
 #include "butil/iobuf.h"                  // butil::IOBuf
 #include "butil/strings/string_piece.h"   // butil::StringPiece
 #include "butil/arena.h"                  // butil::Arena
@@ -27,6 +29,27 @@
 
 
 namespace brpc {
+
+struct RedisReplyParseContext {
+    RedisReplyParseContext()
+        : retained_begin(0), retained_end(0) {}
+
+    void Clear() {
+        backing_buf.clear();
+        retained_begin = 0;
+        retained_end = 0;
+    }
+
+    void Swap(RedisReplyParseContext* other) {
+        backing_buf.swap(other->backing_buf);
+        std::swap(retained_begin, other->retained_begin);
+        std::swap(retained_end, other->retained_end);
+    }
+
+    butil::IOBuf backing_buf;
+    uintptr_t retained_begin;
+    uintptr_t retained_end;
+};
 
 // Different types of replies.
 enum RedisReplyType {
@@ -119,7 +142,8 @@ public:
     // reply. As a contrast, if the parsing needs `buf' to be intact,
     // the complexity in worst case may be O(N^2).
     // Returns PARSE_ERROR_ABSOLUTELY_WRONG if the parsing failed.
-    ParseError ConsumePartialIOBuf(butil::IOBuf& buf);
+    ParseError ConsumePartialIOBuf(
+        butil::IOBuf& buf, RedisReplyParseContext* context = NULL);
 
     // Serialize to iobuf appender using redis protocol
     bool SerializeTo(butil::IOBufAppender* appender);

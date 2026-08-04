@@ -132,13 +132,14 @@ bool RedisReply::SerializeTo(butil::IOBufAppender* appender) {
     return false;
 }
 
-ParseError RedisReply::ConsumePartialIOBuf(butil::IOBuf& buf) {
+ParseError RedisReply::ConsumePartialIOBuf(
+    butil::IOBuf& buf, RedisReplyParseContext* context) {
     if (_type == REDIS_REPLY_ARRAY && _data.array.last_index >= 0) {
         // The parsing was suspended while parsing sub replies,
         // continue the parsing.
         RedisReply* subs = (RedisReply*)_data.array.replies;
         for (int i = _data.array.last_index; i < _length; ++i) {
-            ParseError err = subs[i].ConsumePartialIOBuf(buf);
+            ParseError err = subs[i].ConsumePartialIOBuf(buf, context);
             if (err != PARSE_OK) {
                 return err;
             }
@@ -243,16 +244,40 @@ ParseError RedisReply::ConsumePartialIOBuf(butil::IOBuf& buf) {
                 buf.cutn(_data.short_str, len);
                 _data.short_str[len] = '\0';
             } else {
+                buf.pop_front(crlf_pos + 2/*CRLF*/);
+                _type = REDIS_REPLY_STRING;
+                _length = len;
+                const butil::StringPiece front = buf.backing_block(0);
+                if (context != NULL && front.size() >= (size_t)len + 2 &&
+                    front[len] == '\r' && front[len + 1] == '\n') {
+                    const char* const data = front.data();
+                    const uintptr_t data_begin =
+                        reinterpret_cast<uintptr_t>(data);
+                    if (data_begin < context->retained_begin ||
+                        data_begin + len + 1 > context->retained_end) {
+                        // Retain the complete current BlockRef. Most batched
+                        // Redis replies share a block, so later fields only
+                        // take the two comparisons above instead of another
+                        // IOBuf ref and ref-count operation.
+                        buf.append_to(&context->backing_buf, front.size());
+                        context->retained_begin = data_begin;
+                        context->retained_end = data_begin + front.size();
+                    }
+                    // The CR byte is consumed together with this reply. Reuse
+                    // it as the NUL required by RedisReply::c_str().
+                    char* const writable = const_cast<char*>(data);
+                    writable[len] = '\0';
+                    _data.long_str = writable;
+                    buf.pop_front(len + 2);
+                    return PARSE_OK;
+                }
                 char* d = (char*)_arena->allocate((len/8 + 1)*8);
                 if (d == NULL) {
                     LOG(FATAL) << "Fail to allocate string[" << len << "]";
                     return PARSE_ERROR_ABSOLUTELY_WRONG;
                 }
-                buf.pop_front(crlf_pos + 2/*CRLF*/);
                 buf.cutn(d, len);
                 d[len] = '\0';
-                _type = REDIS_REPLY_STRING;
-                _length = len;
                 _data.long_str = d;
             }
             char crlf[2];
@@ -303,7 +328,7 @@ ParseError RedisReply::ConsumePartialIOBuf(butil::IOBuf& buf) {
             // be continued in next calls by tracking _data.array.last_index.
             _data.array.last_index = 0;
             for (int64_t i = 0; i < count; ++i) {
-                ParseError err = subs[i].ConsumePartialIOBuf(buf);
+                ParseError err = subs[i].ConsumePartialIOBuf(buf, context);
                 if (err != PARSE_OK) {
                     return err;
                 }

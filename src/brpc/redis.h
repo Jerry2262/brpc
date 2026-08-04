@@ -180,6 +180,7 @@ private:
     RedisReply _first_reply;
     RedisReply* _other_replies;
     butil::Arena _arena;
+    RedisReplyParseContext _parse_context;
     int _nreply;
     mutable int _cached_size_;
 };

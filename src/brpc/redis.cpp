@@ -227,6 +227,7 @@ void RedisResponse::Clear() {
     _first_reply.Reset();
     _other_replies = NULL;
     _arena.clear();
+    _parse_context.Clear();
     _nreply = 0;
     _cached_size_ = 0;
 }
@@ -276,6 +277,7 @@ void RedisResponse::Swap(RedisResponse* other) {
         _first_reply.Swap(other->_first_reply);
         std::swap(_other_replies, other->_other_replies);
         _arena.swap(other->_arena);
+        _parse_context.Swap(&other->_parse_context);
         std::swap(_nreply, other->_nreply);
         std::swap(_cached_size_, other->_cached_size_);
     }
@@ -293,7 +295,7 @@ void RedisResponse::Swap(RedisResponse* other) {
 ParseError RedisResponse::ConsumePartialIOBuf(butil::IOBuf& buf, int reply_count) {
     size_t oldsize = buf.size();
     if (reply_size() == 0) {
-        ParseError err = _first_reply.ConsumePartialIOBuf(buf);
+        ParseError err = _first_reply.ConsumePartialIOBuf(buf, &_parse_context);
         if (err != PARSE_OK) {
             return err;
         }
@@ -315,7 +317,8 @@ ParseError RedisResponse::ConsumePartialIOBuf(butil::IOBuf& buf, int reply_count
             }
         }
         for (int i = reply_size(); i < reply_count; ++i) {
-            ParseError err = _other_replies[i - 1].ConsumePartialIOBuf(buf);
+            ParseError err = _other_replies[i - 1].ConsumePartialIOBuf(
+                buf, &_parse_context);
             if (err != PARSE_OK) {
                 return err;
             }
