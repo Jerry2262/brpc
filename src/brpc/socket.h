@@ -540,6 +540,12 @@ public:
     void set_preferred_index(int index) { _preferred_index = index; }
     int preferred_index() const { return _preferred_index; }
 
+    // Process input events directly in EventDispatcher instead of creating a
+    // bthread. This is only enabled for selected client-side protocols.
+    void set_process_input_inline(bool value) {
+        _process_input_inline.store(value, butil::memory_order_relaxed);
+    }
+
     void set_type_of_service(int tos) { _tos = tos; }
 
     // Call this method every second (roughly)
@@ -854,6 +860,8 @@ private:
     // last chosen index of the protocol as a heuristic value to avoid
     // iterating all protocol handlers each time.
     int _preferred_index;
+
+    butil::atomic<bool> _process_input_inline;
 
     // Number of HC since the last SetFailed() was called. Set to 0 when the
     // socket is revived. Only set in HealthCheckTask::OnTriggeringTask()

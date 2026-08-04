@@ -1173,6 +1173,8 @@ void Controller::IssueRPC(int64_t start_realtime_us) {
         }
         tmp_sock.reset();
     }
+    _current_call.sending_sock->set_process_input_inline(
+        _request_protocol == PROTOCOL_REDIS);
     if (_tos > 0) {
         _current_call.sending_sock->set_type_of_service(_tos);
     }

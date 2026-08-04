@@ -459,6 +459,7 @@ Socket::Socket(Forbidden f)
     , _user(NULL)
     , _conn(NULL)
     , _preferred_index(-1)
+    , _process_input_inline(false)
     , _hc_count(0)
     , _last_msg_size(0)
     , _avg_msg_size(0)
@@ -733,6 +734,7 @@ int Socket::OnCreated(const SocketOptions& options) {
     _conn = options.conn;
     _app_connect = options.app_connect;
     _preferred_index = -1;
+    _process_input_inline.store(false, butil::memory_order_relaxed);
     _hc_count = 0;
     CHECK(_read_buf.empty());
     const int64_t cpuwide_now = butil::cpuwide_time_us();
@@ -2270,7 +2272,8 @@ int Socket::OnInputEvent(void* user_data, uint32_t events,
         attr.keytable_pool = p->_keytable_pool;
         attr.tag = bthread_self_tag();
         bthread_attr_set_name(&attr, "ProcessEvent");
-        if (FLAGS_usercode_in_coroutine) {
+        if (FLAGS_usercode_in_coroutine ||
+            p->_process_input_inline.load(butil::memory_order_relaxed)) {
             ProcessEvent(p);
 #if BRPC_WITH_RDMA
         } else if (rdma::FLAGS_rdma_edisp_unsched) {
