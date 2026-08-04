@@ -30,6 +30,45 @@ DEFINE_int32(redis_max_allocation_size, 64 * 1024 * 1024,
 //BAIDU_CASSERT(sizeof(RedisReply) == 24, size_match);
 const int RedisReply::npos = -1;
 
+namespace {
+
+bool ParseRedisInt64(const char* begin, const char* end, int64_t* value) {
+    if (begin == end) {
+        return false;
+    }
+    bool negative = false;
+    if (*begin == '-' || *begin == '+') {
+        negative = (*begin == '-');
+        if (++begin == end) {
+            return false;
+        }
+    }
+    const uint64_t limit = negative
+        ? static_cast<uint64_t>(std::numeric_limits<int64_t>::max()) + 1
+        : static_cast<uint64_t>(std::numeric_limits<int64_t>::max());
+    uint64_t magnitude = 0;
+    for (const char* p = begin; p != end; ++p) {
+        if (*p < '0' || *p > '9') {
+            return false;
+        }
+        const uint64_t digit = static_cast<unsigned>(*p - '0');
+        if (magnitude > (limit - digit) / 10) {
+            return false;
+        }
+        magnitude = magnitude * 10 + digit;
+    }
+    if (!negative) {
+        *value = static_cast<int64_t>(magnitude);
+    } else if (magnitude == limit) {
+        *value = std::numeric_limits<int64_t>::min();
+    } else {
+        *value = -static_cast<int64_t>(magnitude);
+    }
+    return true;
+}
+
+}  // namespace
+
 const char* RedisReplyTypeToString(RedisReplyType type) {
     switch (type) {
     case REDIS_REPLY_STRING: return "string";
@@ -151,17 +190,24 @@ ParseError RedisReply::ConsumePartialIOBuf(butil::IOBuf& buf) {
     case '$':   // Bulk String   "$<length>\r\n<string>\r\n"
     case '*':   // Array         "*<size>\r\n<sub-reply1><sub-reply2>..."
     case ':': { // Integer       ":<integer>\r\n"
-        char intbuf[32];  // enough for fc + 64-bit decimal + \r\n
-        const size_t ncopied = buf.copy_to(intbuf, sizeof(intbuf) - 1);
-        intbuf[ncopied] = '\0';
-        const size_t crlf_pos = butil::StringPiece(intbuf, ncopied).find("\r\n");
-        if (crlf_pos == butil::StringPiece::npos) {  // not enough data
+        char intbuf[32];  // enough for fc + signed 64-bit decimal + CRLF
+        const size_t nfetch = buf.size() < sizeof(intbuf) ? buf.size() : sizeof(intbuf);
+        const char* header = static_cast<const char*>(buf.fetch(intbuf, nfetch));
+        size_t crlf_pos = nfetch;
+        for (size_t i = 1; i + 1 < nfetch; ++i) {
+            if (header[i] == '\r' && header[i + 1] == '\n') {
+                crlf_pos = i;
+                break;
+            }
+        }
+        if (crlf_pos == nfetch) {  // not enough data
             return PARSE_ERROR_NOT_ENOUGH_DATA;
         }
-        char* endptr = NULL;
-        int64_t value = strtoll(intbuf + 1/*skip fc*/, &endptr, 10);
-        if (endptr != intbuf + crlf_pos) {
-            LOG(ERROR) << '`' << intbuf + 1 << "' is not a valid 64-bit decimal";
+        int64_t value = 0;
+        if (!ParseRedisInt64(header + 1, header + crlf_pos, &value)) {
+            LOG(ERROR) << '`'
+                       << butil::StringPiece(header + 1, crlf_pos - 1)
+                       << "' is not a valid 64-bit decimal";
             return PARSE_ERROR_ABSOLUTELY_WRONG;
         }
         if (fc == ':') {
