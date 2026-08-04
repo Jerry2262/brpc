@@ -50,21 +50,22 @@ inline size_t AppendDecimal(char* outbuf, unsigned long d) {
 // short or does not have many %. In a 100K-time call to formating of
 // "GET key1", the time spent on RedisRequest.AddCommand() are ~700ns
 // vs. ~400ns while using snprintf() vs. AppendDecimal() respectively.
-inline void AppendHeader(std::string& buf, char fc, unsigned long value) {
-    char header[32];
+inline size_t FormatHeader(char* header, char fc, unsigned long value) {
     header[0] = fc;
-    size_t len = AppendDecimal(header + 1, value);
+    const size_t len = AppendDecimal(header + 1, value);
     header[len + 1] = '\r';
     header[len + 2] = '\n';
-    buf.append(header, len + 3);
+    return len + 3;
+}
+inline void AppendHeader(std::string& buf, char fc, unsigned long value) {
+    char header[32];
+    const size_t len = FormatHeader(header, fc, value);
+    buf.append(header, len);
 }
 inline void AppendHeader(butil::IOBuf& buf, char fc, unsigned long value) {
     char header[32];
-    header[0] = fc;
-    size_t len = AppendDecimal(header + 1, value);
-    header[len + 1] = '\r';
-    header[len + 2] = '\n';
-    buf.append(header, len + 3);
+    const size_t len = FormatHeader(header, fc, value);
+    buf.append(header, len);
 }
 
 static void FlushComponent(std::string* out, std::string* compbuf, int* ncomp) {
@@ -356,6 +357,30 @@ butil::Status RedisCommandByComponents(butil::IOBuf* output,
     if (output == NULL) {
         return butil::Status(EINVAL, "Param[output] is NULL");
     }
+    // appendv keeps the shared TLS block behavior of IOBuf::append while
+    // coalescing all fragments of a typical command into one BlockRef update.
+    // Keep large/rare commands on the general path to bound stack usage.
+    const size_t kMaxVectoredComponents = 16;
+    if (ncomponents <= kMaxVectoredComponents) {
+        char headers[kMaxVectoredComponents + 1][32];
+        const_iovec vec[1 + kMaxVectoredComponents * 3];
+        size_t nvec = 0;
+        const size_t array_header_len =
+            FormatHeader(headers[0], '*', ncomponents);
+        vec[nvec++] = { headers[0], array_header_len };
+        for (size_t i = 0; i < ncomponents; ++i) {
+            const size_t component_header_len =
+                FormatHeader(headers[i + 1], '$', components[i].size());
+            vec[nvec++] = { headers[i + 1], component_header_len };
+            vec[nvec++] = { components[i].data(), components[i].size() };
+            vec[nvec++] = { "\r\n", 2 };
+        }
+        if (output->appendv(vec, nvec) != 0) {
+            return butil::Status(ENOMEM, "Fail to append Redis components");
+        }
+        return butil::Status::OK();
+    }
+
     AppendHeader(*output, '*', ncomponents);
     for (size_t i = 0; i < ncomponents; ++i) {
         AppendHeader(*output, '$', components[i].size());
