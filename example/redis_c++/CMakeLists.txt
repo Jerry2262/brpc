@@ -36,7 +36,13 @@ execute_process(
 set(CMAKE_PREFIX_PATH ${OUTPUT_PATH})
 
 include(FindThreads)
-include(FindProtobuf)
+# protobuf >= 22 (4.x) depends on abseil-cpp and utf8_validity: its
+# generated code and headers reference absl symbols, so they must be on
+# the link line when brpc is statically linked. Delegate to pkg-config,
+# which expands exactly the dependency set that config_brpc.sh links
+# for the Make-based build (and also covers utf8_validity, cf. #3230).
+find_package(PkgConfig REQUIRED)
+pkg_check_modules(PROTOBUF_DEPS REQUIRED IMPORTED_TARGET protobuf)
 
 find_path(GPERFTOOLS_INCLUDE_DIR NAMES gperftools/heap-profiler.h)
 find_library(GPERFTOOLS_LIBRARIES NAMES tcmalloc_and_profiler)
@@ -85,7 +91,9 @@ if(CMAKE_VERSION VERSION_LESS "3.1.3")
         set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -std=c++11")
     endif()
 else()
-    set(CMAKE_CXX_STANDARD 11)
+    # protobuf >= 22 requires C++14+; config_brpc.sh uses -std=c++17
+    # for protobuf >= 22, so do the same here.
+    set(CMAKE_CXX_STANDARD 17)
     set(CMAKE_CXX_STANDARD_REQUIRED ON)
 endif()
 
@@ -108,7 +116,7 @@ include_directories(${OPENSSL_INCLUDE_DIR})
 set(DYNAMIC_LIB
     ${CMAKE_THREAD_LIBS_INIT}
     ${GFLAGS_LIBRARY}
-    ${PROTOBUF_LIBRARIES}
+    PkgConfig::PROTOBUF_DEPS
     ${LEVELDB_LIB}
     ${OPENSSL_CRYPTO_LIBRARY}
     ${OPENSSL_SSL_LIBRARY}
