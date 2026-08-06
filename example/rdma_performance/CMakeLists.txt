@@ -29,6 +29,13 @@ set(CMAKE_PREFIX_PATH ${OUTPUT_PATH})
 
 include(FindThreads)
 include(FindProtobuf)
+# protobuf >= 22 (4.x) depends on abseil-cpp and utf8_validity: the
+# generated code of test.proto and libbrpc.a reference absl symbols, so
+# they must be on the link line when brpc is statically linked. Delegate
+# to pkg-config, which expands exactly the dependency set that
+# config_brpc.sh links for the Make-based build (cf. #3230).
+find_package(PkgConfig REQUIRED)
+pkg_check_modules(PROTOBUF_DEPS REQUIRED IMPORTED_TARGET protobuf)
 protobuf_generate_cpp(PROTO_SRC PROTO_HEADER test.proto)
 # include PROTO_HEADER
 include_directories(${CMAKE_CURRENT_BINARY_DIR})
@@ -108,7 +115,7 @@ endif()
 set(DYNAMIC_LIB
     ${CMAKE_THREAD_LIBS_INIT}
     ${GFLAGS_LIBRARY}
-    ${PROTOBUF_LIBRARIES}
+    PkgConfig::PROTOBUF_DEPS
     ${LEVELDB_LIB}
     ${OPENSSL_CRYPTO_LIBRARY}
     ${OPENSSL_SSL_LIBRARY}
