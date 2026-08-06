@@ -77,7 +77,9 @@ if(CMAKE_VERSION VERSION_LESS "3.1.3")
         set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -std=c++11")
     endif()
 else()
-    set(CMAKE_CXX_STANDARD 11)
+    # protobuf >= 22 requires C++14+; config_brpc.sh uses -std=c++17
+    # for protobuf >= 22, so do the same here.
+    set(CMAKE_CXX_STANDARD 17)
     set(CMAKE_CXX_STANDARD_REQUIRED ON)
 endif()
 
